@@ -25,7 +25,8 @@ NAME = os.environ.get("HM_NODE_NAME", "main")
 TEST = runner.TEST
 SKIP_GATE = os.environ.get("HM_SKIP_GATE", "0") == "1"
 NODE_KEY = os.environ.get("HM_NODE_KEY")
-POLL_SECONDS = 5
+POLL_SECONDS = 5          # first wait when there is no work
+MAX_POLL_SECONDS = 120    # waits double up to this when idle
 WAIT_SECONDS = 60          # pause between checks while the gate says WAIT
 CHECKIN_EVERY = 600
 TEST_MAX_IDLE = 3          # in test mode, exit after this many empty polls
@@ -113,7 +114,10 @@ def main():
                 if TEST and idle >= TEST_MAX_IDLE:
                     log("no more work, stopping")
                     break
-                time.sleep(POLL_SECONDS)
+                wait = min(POLL_SECONDS * 2 ** (idle - 1), MAX_POLL_SECONDS)
+                if wait >= 40:
+                    log("no work, next check in %ds" % wait)
+                time.sleep(wait)
                 continue
             idle = 0
 
