@@ -7,10 +7,11 @@
     <application
         android:allowBackup="false"
         android:label="Hexagon Mesh"
-        android:theme="@android:style/Theme.DeviceDefault">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <!-- Needed from Android 12 so the app may load Qualcomm's NPU (DSP) library. -->
         <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
 
         <activity
             android:name=".MainActivity"

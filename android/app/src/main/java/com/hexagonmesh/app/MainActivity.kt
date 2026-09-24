@@ -12,14 +12,18 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.system.Os
+import android.view.WindowInsets
+import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-/** M0: shows everything the node needs to know about this phone, refreshed every 2 seconds. */
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
+    private lateinit var npuLog: TextView
+    private lateinit var npuButton: Button
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
@@ -30,18 +34,51 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Let the Hexagon DSP loader find the QNN libraries shipped inside this app.
+        val nativeDir = applicationInfo.nativeLibraryDir
+        Os.setenv("ADSP_LIBRARY_PATH",
+            "$nativeDir;/odm/lib/rfsa/adsp;/vendor/lib/rfsa/adsp/;/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp;/dsp",
+            true)
+
         val pad = (16 * resources.displayMetrics.density).toInt()
         val title = TextView(this).apply { text = "Hexagon Mesh"; textSize = 28f }
         val subtitle = TextView(this).apply { text = "Node status, updates every 2 seconds"; textSize = 14f }
-        status = TextView(this).apply { textSize = 18f; setPadding(0, pad, 0, 0) }
+        status = TextView(this).apply { textSize = 17f; setPadding(0, pad, 0, pad) }
+        npuButton = Button(this).apply {
+            text = "Run NPU test"
+            setOnClickListener { startNpuTest() }
+        }
+        npuLog = TextView(this).apply { textSize = 15f; setPadding(0, pad, 0, pad) }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad * 3, pad, pad)
-            addView(title)
-            addView(subtitle)
-            addView(status)
+            setPadding(pad, pad, pad, pad)
+            addView(title); addView(subtitle); addView(status); addView(npuButton); addView(npuLog)
         }
-        setContentView(ScrollView(this).apply { addView(column) })
+        val scroll = ScrollView(this).apply { addView(column) }
+        // Keep content clear of the status bar and navigation bar (edge-to-edge on Android 15+).
+        scroll.setOnApplyWindowInsetsListener { _, insets ->
+            val top: Int
+            val bottom: Int
+            if (Build.VERSION.SDK_INT >= 30) {
+                val bars = insets.getInsets(WindowInsets.Type.systemBars())
+                top = bars.top; bottom = bars.bottom
+            } else {
+                top = insets.systemWindowInsetTop
+                bottom = insets.systemWindowInsetBottom
+            }
+            column.setPadding(pad, top + pad, pad, bottom + pad)
+            insets
+        }
+        setContentView(scroll)
+    }
+
+    private fun startNpuTest() {
+        npuButton.isEnabled = false
+        npuLog.text = "Running NPU test (about 10-30 seconds)...\n"
+        Thread {
+            NpuTest.run(this) { line -> runOnUiThread { npuLog.append(line + "\n") } }
+            runOnUiThread { npuButton.isEnabled = true; npuLog.append("Done.\n") }
+        }.start()
     }
 
     override fun onResume() {

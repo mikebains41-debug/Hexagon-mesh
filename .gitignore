@@ -7,3 +7,7 @@ __pycache__/
 models/
 *.gguf
 *.bin
+android/app/src/main/assets/*.onnx
+android/.gradle/
+android/build/
+android/app/build/

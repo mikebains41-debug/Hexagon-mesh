@@ -3,7 +3,7 @@ name: Build Android app
 on:
   push:
     branches: [main]
-    paths: ["android/**", ".github/workflows/android.yml"]
+    paths: ["android/**", "tools/make_npu_test_model.py", ".github/workflows/android.yml"]
   workflow_dispatch:
 
 permissions:
@@ -19,6 +19,9 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+
+      - name: Generate NPU test model
+        run: mkdir -p android/app/src/main/assets && python3 tools/make_npu_test_model.py android/app/src/main/assets/npu_test.onnx
 
       - uses: gradle/actions/setup-gradle@v4
         with:
