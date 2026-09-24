@@ -291,15 +291,23 @@ def internal_cosines(float_path, q_path, batch, names):
     return out
 
 
-RECIPES = [
-    ("minmax", {}, {}, 6),
-    ("minmax_12batches", {}, {}, 12),
-    ("percentile", {"calibrate_method": CalibrationMethod.Percentile}, {"CalibPercentile": 99.999}, 6),
-    ("symmetric_act", {"activation_symmetric": True}, {}, 6),
-    ("int8_sym_weights", {"weight_type": QuantType.QInt8}, {}, 6),
-    ("float_layernorm_gelu", {"exclude_types": ("LayerNormalization", "Gelu")}, {}, 6),
-    ("float_residual_adds", {"exclude_types": ("Add",)}, {}, 6),
+# Node-name patterns for each part of a BERT layer (names come from the Hugging Face export).
+GROUPS = {
+    "attn_qkv_proj":  lambda n: n.endswith(("query/MatMul", "key/MatMul", "value/MatMul")),
+    "attn_scores":    lambda n: ("attention/self/MatMul" in n) or n.endswith("Softmax") or ("attention/self/Mul" in n) or ("attention/self/Add" in n),
+    "attn_out_proj":  lambda n: "attention/output/dense/MatMul" in n,
+    "ffn_up":         lambda n: "intermediate/dense/MatMul" in n,
+    "ffn_down":       lambda n: ("output/dense/MatMul" in n) and ("attention" not in n),
+    "embeddings":     lambda n: "embeddings" in n,
+}
+
+RECIPES = [("minmax", {}, {}, 6)] + [
+    ("float_" + g, {"exclude_fn": fn}, {}, 6) for g, fn in GROUPS.items()
 ]
+
+
+def nodes_matching(path, fn):
+    return [n.name for n in onnx.load(path).graph.node if fn(n.name)]
 
 
 def run_recipes(ln, calib_batches, test, ref, diag_names, tmp):
@@ -310,6 +318,14 @@ def run_recipes(ln, calib_batches, test, ref, diag_names, tmp):
         exclude = kw.pop("exclude_types", None)
         if exclude:
             kw["nodes_to_exclude"] = nodes_of_types(ln, exclude)
+        exclude_fn = kw.pop("exclude_fn", None)
+        if exclude_fn:
+            kw["nodes_to_exclude"] = nodes_matching(ln, exclude_fn)
+            print("  %s: %d nodes kept in float" % (name, len(kw["nodes_to_exclude"])))
+            if not kw["nodes_to_exclude"]:
+                print("  (no node names matched; skipping)")
+                rows.append({"recipe": name, "avg": 0.0, "worst": 0.0, "worst_layer": None, "path": None, "error": "no nodes matched"})
+                continue
         try:
             cfg = get_qnn_qdq_config(ln, Reader(calib_batches[:nbatches]),
                                      activation_type=QuantType.QUInt16,
@@ -412,6 +428,8 @@ def main(src, tok_path, out_dir):
     # 4. Quantization recipe search: score each on CPU, keep the best
     calib12 = calib + [encode(tok, make_docs(BATCH, 3000 + i)) for i in range(6)]
     diag_names = [d["name"] for d in report["diag_outputs"]]
+    sample_names = [n.name for n in onnx.load(ln).graph.node if n.op_type == "MatMul"][:8]
+    print("sample MatMul node names:", sample_names)
     rows = run_recipes(ln, calib12, test, ref, diag_names, tmp)
     best = max(rows, key=lambda r: r["avg"])
     if best["path"] is None:

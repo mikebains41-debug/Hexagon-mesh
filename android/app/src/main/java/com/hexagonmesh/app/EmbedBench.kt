@@ -16,7 +16,7 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * M2.5: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
+ * M2.6: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
  * each accelerator variant is scored for speed, accuracy (PASS at cosine 0.99) and where its
  * operations ran. The best passing NPU variant then gets a sustained power run.
  */
@@ -174,9 +174,9 @@ object EmbedBench {
 
     /** Copies a model out of the APK once, so ONNX Runtime can load it without using app memory. */
     internal fun assetToFile(ctx: Context, name: String): String {
-        val f = File(ctx.filesDir, "m25_$name")
+        val f = File(ctx.filesDir, "m26_$name")
         if (!f.exists() || f.length() == 0L) {
-            val tmp = File(ctx.filesDir, "m25_$name.tmp")
+            val tmp = File(ctx.filesDir, "m26_$name.tmp")
             ctx.assets.open(name).use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
             tmp.renameTo(f)
         }
