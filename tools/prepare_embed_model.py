@@ -291,56 +291,62 @@ def internal_cosines(float_path, q_path, batch, names):
     return out
 
 
-# Node-name patterns for each part of a BERT layer (names come from the Hugging Face export).
-GROUPS = {
-    "attn_qkv_proj":  lambda n: n.endswith(("query/MatMul", "key/MatMul", "value/MatMul")),
-    "attn_scores":    lambda n: ("attention/self/MatMul" in n) or n.endswith("Softmax") or ("attention/self/Mul" in n) or ("attention/self/Add" in n),
-    "attn_out_proj":  lambda n: "attention/output/dense/MatMul" in n,
-    "ffn_up":         lambda n: "intermediate/dense/MatMul" in n,
-    "ffn_down":       lambda n: ("output/dense/MatMul" in n) and ("attention" not in n),
-    "embeddings":     lambda n: "embeddings" in n,
-}
+def set_opset(src, dst, version):
+    """Bumps the ONNX opset number without running the version converter (no op rewrites)."""
+    m = onnx.load(src)
+    for x in m.opset_import:
+        if x.domain in ("", "ai.onnx"):
+            x.version = version
+    onnx.save(m, dst)
 
-RECIPES = [("minmax", {}, {}, 6)] + [
-    ("float_" + g, {"exclude_fn": fn}, {}, 6) for g, fn in GROUPS.items()
-]
+
+def convert_opset(src, dst, version):
+    """Runs onnx's version converter, the same way the quantizer does automatically."""
+    onnx.save(version_converter.convert_version(onnx.load(src), version), dst)
 
 
 def nodes_matching(path, fn):
     return [n.name for n in onnx.load(path).graph.node if fn(n.name)]
 
 
+def quantize_variant(base, dst, calib_batches, op_types=None):
+    cfg = get_qnn_qdq_config(base, Reader(calib_batches), activation_type=QuantType.QUInt16,
+                             weight_type=QuantType.QUInt8, op_types_to_quantize=op_types)
+    quantize(base, dst, cfg)
+    return dst
+
+
 def run_recipes(ln, calib_batches, test, ref, diag_names, tmp):
+    """Isolates where the quantized model's loss comes from, then quantizes from the best base."""
     rows = []
-    for name, kwargs, extra, nbatches in RECIPES:
-        q = os.path.join(tmp, "q_%s.onnx" % name)
-        kw = dict(kwargs)
-        exclude = kw.pop("exclude_types", None)
-        if exclude:
-            kw["nodes_to_exclude"] = nodes_of_types(ln, exclude)
-        exclude_fn = kw.pop("exclude_fn", None)
-        if exclude_fn:
-            kw["nodes_to_exclude"] = nodes_matching(ln, exclude_fn)
-            print("  %s: %d nodes kept in float" % (name, len(kw["nodes_to_exclude"])))
-            if not kw["nodes_to_exclude"]:
-                print("  (no node names matched; skipping)")
-                rows.append({"recipe": name, "avg": 0.0, "worst": 0.0, "worst_layer": None, "path": None, "error": "no nodes matched"})
-                continue
+
+    def score(name, path, base=None):
+        avg, worst = cosine(ref, embed(path, test))
+        rows.append({"recipe": name, "avg": round(avg, 4), "worst": round(worst, 4), "path": path})
+        print("%-34s final %.4f (worst doc %.4f)" % (name, avg, worst))
+
+    conv = os.path.join(tmp, "opset21_converted.onnx")
+    bump = os.path.join(tmp, "opset21_bumped.onnx")
+    try:
+        convert_opset(ln, conv, 21)
+        score("fp32_opset21_converted (no quant)", conv)
+    except Exception as e:
+        print("version converter failed:", str(e)[:200])
+    set_opset(ln, bump, 21)
+    score("fp32_opset21_bumped (no quant)", bump)
+
+    for label, base in (("from_opset17", ln), ("from_opset21_bumped", bump)):
         try:
-            cfg = get_qnn_qdq_config(ln, Reader(calib_batches[:nbatches]),
-                                     activation_type=QuantType.QUInt16,
-                                     weight_type=kw.pop("weight_type", QuantType.QUInt8), **kw)
-            cfg.extra_options.update(extra)
-            quantize(ln, q, cfg)
-            avg, worst = cosine(ref, embed(q, test))
-            layers = internal_cosines(ln, q, test[0], diag_names)
-            first = min(layers.values()) if layers else None
-            rows.append({"recipe": name, "avg": round(avg, 4), "worst": round(worst, 4),
-                         "worst_layer": round(first, 4) if first is not None else None, "path": q})
-            print("recipe %-22s final %.4f (worst doc %.4f)  worst checkpoint %.4f" % (name, avg, worst, first or 0))
+            q0 = quantize_variant(base, os.path.join(tmp, "q_none_%s.onnx" % label), calib_batches, op_types=["__none__"])
+            score("quant_nothing_%s" % label, q0)
         except Exception as e:
-            print("recipe %-22s FAILED: %s" % (name, str(e)[:160]))
-            rows.append({"recipe": name, "avg": 0.0, "worst": 0.0, "worst_layer": None, "path": None, "error": str(e)[:160]})
+            print("quant_nothing_%s failed: %s" % (label, str(e)[:160]))
+        try:
+            q = quantize_variant(base, os.path.join(tmp, "q_minmax_%s.onnx" % label), calib_batches)
+            score("a16w8_%s" % label, q)
+        except Exception as e:
+            print("a16w8_%s failed: %s" % (label, str(e)[:160]))
+            rows.append({"recipe": "a16w8_%s" % label, "avg": 0.0, "worst": 0.0, "path": None, "error": str(e)[:160]})
     return rows
 
 
@@ -428,10 +434,10 @@ def main(src, tok_path, out_dir):
     # 4. Quantization recipe search: score each on CPU, keep the best
     calib12 = calib + [encode(tok, make_docs(BATCH, 3000 + i)) for i in range(6)]
     diag_names = [d["name"] for d in report["diag_outputs"]]
-    sample_names = [n.name for n in onnx.load(ln).graph.node if n.op_type == "MatMul"][:8]
-    print("sample MatMul node names:", sample_names)
+    print("op types in model:", sorted(op_counts(ln).items()))
     rows = run_recipes(ln, calib12, test, ref, diag_names, tmp)
-    best = max(rows, key=lambda r: r["avg"])
+    quant_rows = [r for r in rows if r["recipe"].startswith("a16w8_") and r.get("path")]
+    best = max(quant_rows, key=lambda r: r["avg"]) if quant_rows else {"path": None}
     if best["path"] is None:
         sys.exit("every quantization recipe failed")
     q = os.path.join(out_dir, "minilm_a16w8_16x256.onnx")
