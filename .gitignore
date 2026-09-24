@@ -11,3 +11,4 @@ android/app/src/main/assets/*.onnx
 android/.gradle/
 android/build/
 android/app/build/
+android/app/src/main/assets/

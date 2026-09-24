@@ -3,7 +3,7 @@ name: Build Android app
 on:
   push:
     branches: [main]
-    paths: ["android/**", "tools/make_npu_test_model.py", ".github/workflows/android.yml"]
+    paths: ["android/**", "tools/**", ".github/workflows/android.yml"]
   workflow_dispatch:
 
 permissions:
@@ -19,6 +19,18 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare embedding model (all-MiniLM-L6-v2, fixed 16x256)
+        run: |
+          pip install onnx onnxruntime numpy
+          mkdir -p android/app/src/main/assets
+          curl -fL -o /tmp/minilm.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+          curl -fL -o android/app/src/main/assets/vocab.txt https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt
+          python tools/prepare_embed_model.py /tmp/minilm.onnx android/app/src/main/assets/minilm_16x256.onnx
 
       - name: Generate NPU test model
         run: mkdir -p android/app/src/main/assets && python3 tools/make_npu_test_model.py android/app/src/main/assets/npu_test.onnx

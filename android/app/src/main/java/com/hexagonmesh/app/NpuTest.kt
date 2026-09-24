@@ -87,7 +87,7 @@ object NpuTest {
     }
 
     /** addQnn is looked up at runtime so a missing method gives a clear message, not a crash. */
-    private fun addQnn(opts: OrtSession.SessionOptions, options: Map<String, String>) {
+    internal fun addQnn(opts: OrtSession.SessionOptions, options: Map<String, String>) {
         val m = opts.javaClass.methods.firstOrNull { it.name == "addQnn" && it.parameterTypes.size == 1 }
             ?: throw IllegalStateException("this ONNX Runtime has no addQnn(); available: " +
                 opts.javaClass.methods.map { it.name }.filter { it.startsWith("add") }.distinct())
@@ -114,7 +114,7 @@ object NpuTest {
     }
 
     /** Counts which execution provider ran each operation, from the profiling JSON. */
-    private fun providerReport(path: String): String {
+    internal fun providerReport(path: String): String {
         val text = try { File(path).readText() } catch (e: Exception) { return "Profile unreadable: ${e.message}" }
         val counts = Regex("\"provider\"\\s*:\\s*\"(\\w+)\"").findAll(text)
             .groupingBy { it.groupValues[1] }.eachCount()
@@ -124,7 +124,7 @@ object NpuTest {
             if (onNpu) "\nPROOF: every operation ran on the Hexagon NPU" else "\nWARNING: some operations did not run on the NPU"
     }
 
-    private fun reason(e: Throwable): String {
+    internal fun reason(e: Throwable): String {
         val root = if (e is InvocationTargetException && e.cause != null) e.cause!! else e
         return (root.message ?: root.javaClass.simpleName).take(600)
     }

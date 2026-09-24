@@ -24,6 +24,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var npuLog: TextView
     private lateinit var npuButton: Button
+    private lateinit var embedButton: Button
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
@@ -48,11 +49,15 @@ class MainActivity : Activity() {
             text = "Run NPU test"
             setOnClickListener { startNpuTest() }
         }
+        embedButton = Button(this).apply {
+            text = "Run embedding benchmark (real AI)"
+            setOnClickListener { startEmbedBench() }
+        }
         npuLog = TextView(this).apply { textSize = 15f; setPadding(0, pad, 0, pad) }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
-            addView(title); addView(subtitle); addView(status); addView(npuButton); addView(npuLog)
+            addView(title); addView(subtitle); addView(status); addView(npuButton); addView(embedButton); addView(npuLog)
         }
         val scroll = ScrollView(this).apply { addView(column) }
         // Keep content clear of the status bar and navigation bar (edge-to-edge on Android 15+).
@@ -73,11 +78,30 @@ class MainActivity : Activity() {
     }
 
     private fun startNpuTest() {
+        runInBackground("Running NPU test (about 10-30 seconds)...") { log -> NpuTest.run(this, log) }
+    }
+
+    private fun startEmbedBench() {
+        runInBackground("Running embedding benchmark (about 2 minutes, keep the app open, unplugged for power numbers)...") { log ->
+            EmbedBench.run(this, log)
+        }
+    }
+
+    private fun runInBackground(intro: String, task: ((String) -> Unit) -> Unit) {
         npuButton.isEnabled = false
-        npuLog.text = "Running NPU test (about 10-30 seconds)...\n"
+        embedButton.isEnabled = false
+        npuLog.text = intro + "\n"
         Thread {
-            NpuTest.run(this) { line -> runOnUiThread { npuLog.append(line + "\n") } }
-            runOnUiThread { npuButton.isEnabled = true; npuLog.append("Done.\n") }
+            try {
+                task { line -> runOnUiThread { npuLog.append(line + "\n") } }
+            } catch (e: Throwable) {
+                runOnUiThread { npuLog.append("Error: ${e.message}\n") }
+            }
+            runOnUiThread {
+                npuButton.isEnabled = true
+                embedButton.isEnabled = true
+                npuLog.append("Done.\n")
+            }
         }.start()
     }
 
