@@ -53,7 +53,7 @@ object Diag {
         }
         try {
             val variants = listOf(
-                Triple("NPU quantized (16-bit act, 8-bit weights)", qPath, false),
+                Triple("NPU mixed (quantized + fp16 residual)", qPath, true),
             )
             for ((label, path, fp16) in variants) {
                 log("\n[$label]")

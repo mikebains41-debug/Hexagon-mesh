@@ -309,44 +309,38 @@ def nodes_matching(path, fn):
     return [n.name for n in onnx.load(path).graph.node if fn(n.name)]
 
 
-def quantize_variant(base, dst, calib_batches, op_types=None):
-    cfg = get_qnn_qdq_config(base, Reader(calib_batches), activation_type=QuantType.QUInt16,
-                             weight_type=QuantType.QUInt8, op_types_to_quantize=op_types)
-    quantize(base, dst, cfg)
-    return dst
+def exclude_nodes(path, types=(), patterns=()):
+    return [n.name for n in onnx.load(path).graph.node
+            if n.op_type in types or any(pt in n.name for pt in patterns)]
+
+
+# Keep the residual stream (LayerNorm, residual Adds, the Reshapes around them, and the projections that
+# write into it) in floating point; quantize the heavy math inside each layer.
+RECIPES = [
+    ("a16w8_all", (), ()),
+    ("float_ln_add_reshape", ("LayerNormalization", "Add", "Reshape"), ()),
+    ("float_residual", ("LayerNormalization", "Add", "Reshape"), ("output/dense",)),
+    ("float_residual_ffn", ("LayerNormalization", "Add", "Reshape", "Gelu"), ("output/dense", "intermediate/dense")),
+    ("float_residual_ffn_embed", ("LayerNormalization", "Add", "Reshape", "Gelu", "Gather"), ("output/dense", "intermediate/dense")),
+]
 
 
 def run_recipes(ln, calib_batches, test, ref, diag_names, tmp):
-    """Isolates where the quantized model's loss comes from, then quantizes from the best base."""
     rows = []
-
-    def score(name, path, base=None):
-        avg, worst = cosine(ref, embed(path, test))
-        rows.append({"recipe": name, "avg": round(avg, 4), "worst": round(worst, 4), "path": path})
-        print("%-34s final %.4f (worst doc %.4f)" % (name, avg, worst))
-
-    conv = os.path.join(tmp, "opset21_converted.onnx")
-    bump = os.path.join(tmp, "opset21_bumped.onnx")
-    try:
-        convert_opset(ln, conv, 21)
-        score("fp32_opset21_converted (no quant)", conv)
-    except Exception as e:
-        print("version converter failed:", str(e)[:200])
-    set_opset(ln, bump, 21)
-    score("fp32_opset21_bumped (no quant)", bump)
-
-    for label, base in (("from_opset17", ln), ("from_opset21_bumped", bump)):
+    for name, types, patterns in RECIPES:
+        q = os.path.join(tmp, "q_%s.onnx" % name)
+        excl = exclude_nodes(ln, types, patterns)
         try:
-            q0 = quantize_variant(base, os.path.join(tmp, "q_none_%s.onnx" % label), calib_batches, op_types=["__none__"])
-            score("quant_nothing_%s" % label, q0)
+            cfg = get_qnn_qdq_config(ln, Reader(calib_batches), activation_type=QuantType.QUInt16,
+                                     weight_type=QuantType.QUInt8, nodes_to_exclude=excl or None)
+            quantize(ln, q, cfg)
+            avg, worst = cosine(ref, embed(q, test))
+            rows.append({"recipe": name, "avg": round(avg, 4), "worst": round(worst, 4), "path": q,
+                         "float_nodes": len(excl)})
+            print("recipe %-26s final %.4f (worst doc %.4f)  [%d nodes kept float]" % (name, avg, worst, len(excl)))
         except Exception as e:
-            print("quant_nothing_%s failed: %s" % (label, str(e)[:160]))
-        try:
-            q = quantize_variant(base, os.path.join(tmp, "q_minmax_%s.onnx" % label), calib_batches)
-            score("a16w8_%s" % label, q)
-        except Exception as e:
-            print("a16w8_%s failed: %s" % (label, str(e)[:160]))
-            rows.append({"recipe": "a16w8_%s" % label, "avg": 0.0, "worst": 0.0, "path": None, "error": str(e)[:160]})
+            print("recipe %-26s FAILED: %s" % (name, str(e)[:160]))
+            rows.append({"recipe": name, "avg": 0.0, "worst": 0.0, "path": None, "error": str(e)[:160]})
     return rows
 
 
@@ -435,8 +429,9 @@ def main(src, tok_path, out_dir):
     calib12 = calib + [encode(tok, make_docs(BATCH, 3000 + i)) for i in range(6)]
     diag_names = [d["name"] for d in report["diag_outputs"]]
     print("op types in model:", sorted(op_counts(ln).items()))
+    print("sample Gemm node names:", [n.name for n in onnx.load(ln).graph.node if n.op_type == "Gemm"][:6])
     rows = run_recipes(ln, calib12, test, ref, diag_names, tmp)
-    quant_rows = [r for r in rows if r["recipe"].startswith("a16w8_") and r.get("path")]
+    quant_rows = [r for r in rows if r.get("path")]
     best = max(quant_rows, key=lambda r: r["avg"]) if quant_rows else {"path": None}
     if best["path"] is None:
         sys.exit("every quantization recipe failed")

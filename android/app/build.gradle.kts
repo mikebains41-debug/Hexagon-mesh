@@ -11,8 +11,8 @@ android {
         applicationId = "com.hexagonmesh.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.10.0"
+        versionCode = 11
+        versionName = "0.11.0"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 

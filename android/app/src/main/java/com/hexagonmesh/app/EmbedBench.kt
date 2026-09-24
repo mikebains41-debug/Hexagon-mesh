@@ -16,7 +16,7 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * M2.7: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
+ * M2.8: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
  * each accelerator variant is scored for speed, accuracy (PASS at cosine 0.99) and where its
  * operations ran. The best passing NPU variant then gets a sustained power run.
  */
@@ -35,7 +35,7 @@ object EmbedBench {
     private class Variant(val label: String, val file: String, val backend: String, val fp16: Boolean)
 
     private val VARIANTS = listOf(
-        Variant("NPU quantized (16-bit act, 8-bit weights), best recipe", Q8_MODEL, HTP, false),
+        Variant("NPU mixed: quantized layers + fp16 residual stream, best recipe", Q8_MODEL, HTP, true),
         Variant("GPU fp32 (Adreno), for comparison", LN_MODEL, GPU, false),
     )
 
@@ -174,9 +174,9 @@ object EmbedBench {
 
     /** Copies a model out of the APK once, so ONNX Runtime can load it without using app memory. */
     internal fun assetToFile(ctx: Context, name: String): String {
-        val f = File(ctx.filesDir, "m27_$name")
+        val f = File(ctx.filesDir, "m28_$name")
         if (!f.exists() || f.length() == 0L) {
-            val tmp = File(ctx.filesDir, "m27_$name.tmp")
+            val tmp = File(ctx.filesDir, "m28_$name.tmp")
             ctx.assets.open(name).use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
             tmp.renameTo(f)
         }
