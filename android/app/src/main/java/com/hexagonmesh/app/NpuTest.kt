@@ -121,7 +121,7 @@ object NpuTest {
         if (counts.isEmpty()) return "Profile: no per-operation records found"
         val onNpu = counts.keys.all { it == "QNNExecutionProvider" }
         return "Where ops ran: " + counts.entries.joinToString { "${it.key} x${it.value}" } +
-            if (onNpu) "\nPROOF: every operation ran on the Hexagon NPU" else "\nWARNING: some operations did not run on the NPU"
+            if (onNpu) "\nPROOF: every operation ran on the selected Qualcomm accelerator, none on the CPU" else "\nWARNING: some operations fell back to the CPU"
     }
 
     internal fun reason(e: Throwable): String {

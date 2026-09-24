@@ -1,8 +1,10 @@
 """Prepares the NPU embedding models and diagnoses fp16 accuracy (runs on GitHub's build server).
 
 Outputs in OUT_DIR:
-  minilm_ln_16x256.onnx     fp32, static 16x256, LayerNorm + Gelu fused (CPU reference and NPU fp16 variant)
-  minilm_a16w8_16x256.onnx  quantized for the NPU: 16-bit activations, 8-bit weights
+  minilm_ln_16x256.onnx      fp32, static 16x256, LayerNorm + Gelu fused, LayerNorm inputs pre-scaled
+                             (CPU reference, GPU, and NPU fp16 variant)
+  minilm_a16w8_16x256.onnx   quantized for the NPU: 16-bit activations, 8-bit weights
+  minilm_a16w16_16x256.onnx  quantized for the NPU: 16-bit activations, 16-bit weights
   embed_variants.json       build-server checks shown in the app
 
 Usage: python tools/prepare_embed_model.py MODEL.onnx TOKENIZER.json OUT_DIR
@@ -17,7 +19,7 @@ import tempfile
 import numpy as np
 import onnx
 import onnxruntime as ort
-from onnx import TensorProto, numpy_helper, version_converter
+from onnx import TensorProto, helper, numpy_helper, version_converter
 from onnxruntime.quantization import CalibrationDataReader, QuantType, quantize
 from onnxruntime.quantization.execution_providers.qnn import get_qnn_qdq_config, qnn_preprocess_model
 from tokenizers import Tokenizer
@@ -25,6 +27,7 @@ from tokenizers import Tokenizer
 BATCH, SEQ = 16, 256
 MASK_MIN = -100.0          # replaces float32-min padding constants; safe in fp16 and 16-bit quantization
 FP16_MAX = 65504.0
+LN_PRESCALE = 1.0 / 16     # LayerNorm is scale-invariant; this keeps its squared values far below fp16's limit
 
 WORDS = ("the a an and or but of to in on for with from by at as is are was were be been "
          "network phone data model energy system report customer market service order price value "
@@ -143,6 +146,26 @@ class Reader(CalibrationDataReader):
         return next(self.it, None)
 
 
+def prescale_layernorms(src, dst, scale):
+    """Multiplies each LayerNormalization input by `scale`. LayerNorm(s*x) == LayerNorm(x), so results are
+    unchanged, but the squares it sums internally shrink by scale**2 and can no longer overflow fp16."""
+    m = onnx.load(src)
+    g = m.graph
+    g.initializer.append(numpy_helper.from_array(np.array(scale, dtype=np.float32), "ln_prescale"))
+    nodes, count = [], 0
+    for n in g.node:
+        if n.op_type == "LayerNormalization":
+            scaled = "%s_prescaled_input" % (n.name or "ln%d" % count)
+            nodes.append(helper.make_node("Mul", [n.input[0], "ln_prescale"], [scaled], name=scaled + "_mul"))
+            n.input[0] = scaled
+            count += 1
+        nodes.append(n)
+    del g.node[:]
+    g.node.extend(nodes)
+    onnx.save(m, dst)
+    return count
+
+
 def op_counts(path):
     counts = {}
     for n in onnx.load(path).graph.node:
@@ -189,30 +212,39 @@ def main(src, tok_path, out_dir):
                     x.version = 17
     up = os.path.join(tmp, "opset17.onnx")
     onnx.save(m, up)
-    ln = os.path.join(out_dir, "minilm_ln_16x256.onnx")
-    if not qnn_preprocess_model(up, ln, fuse_layernorm=True):
-        shutil.copy(up, ln)
-    counts = op_counts(ln)
+    fused = os.path.join(tmp, "fused.onnx")
+    if not qnn_preprocess_model(up, fused, fuse_layernorm=True):
+        shutil.copy(up, fused)
+    counts = op_counts(fused)
     report["fused"] = {k: counts.get(k, 0) for k in ("LayerNormalization", "Gelu", "Pow", "Erf")}
     print("ops after fusion:", report["fused"])
 
+    ln = os.path.join(out_dir, "minilm_ln_16x256.onnx")
+    report["prescaled_layernorms"] = prescale_layernorms(fused, ln, LN_PRESCALE)
+    report["prescale"] = LN_PRESCALE
+    print("pre-scaled LayerNorms:", report["prescaled_layernorms"])
+
     ref = embed(fixed, test)
     report["ln_vs_original"] = cosine(ref, embed(ln, test))
-    print("fused fp32 vs original (cosine avg, worst):", report["ln_vs_original"])
+    print("fused + pre-scaled fp32 vs original (cosine avg, worst):", report["ln_vs_original"])
 
-    # 4. Quantize for the NPU: 16-bit activations, 8-bit weights
-    q = os.path.join(out_dir, "minilm_a16w8_16x256.onnx")
-    qcfg = get_qnn_qdq_config(ln, Reader(calib), activation_type=QuantType.QUInt16, weight_type=QuantType.QUInt8)
-    quantize(ln, q, qcfg)
-    report["a16w8_vs_original"] = cosine(ref, embed(q, test))
-    print("quantized vs original (cosine avg, worst):", report["a16w8_vs_original"])
+    # 4. Quantize for the NPU: 16-bit activations with 8-bit and with 16-bit weights
+    variants = [("a16w8", QuantType.QUInt8), ("a16w16", QuantType.QUInt16)]
+    outputs = [ln]
+    for name, wtype in variants:
+        q = os.path.join(out_dir, "minilm_%s_16x256.onnx" % name)
+        qcfg = get_qnn_qdq_config(ln, Reader(calib), activation_type=QuantType.QUInt16, weight_type=wtype)
+        quantize(ln, q, qcfg)
+        report["%s_vs_original" % name] = cosine(ref, embed(q, test))
+        print("%s vs original (cosine avg, worst):" % name, report["%s_vs_original" % name])
+        outputs.append(q)
 
     with open(os.path.join(out_dir, "embed_variants.json"), "w") as fh:
         json.dump(report, fh)
-    for f in (ln, q):
+    for f in outputs:
         print(os.path.basename(f), "%.1f MB" % (os.path.getsize(f) / 1e6))
     if report["ln_vs_original"][0] < 0.999:
-        sys.exit("fused model does not match the original")
+        sys.exit("fused/pre-scaled model does not match the original")
 
 
 if __name__ == "__main__":
