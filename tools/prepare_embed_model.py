@@ -317,11 +317,7 @@ def exclude_nodes(path, types=(), patterns=()):
 # Keep the residual stream (LayerNorm, residual Adds, the Reshapes around them, and the projections that
 # write into it) in floating point; quantize the heavy math inside each layer.
 RECIPES = [
-    ("a16w8_all", (), ()),
-    ("float_ln_add_reshape", ("LayerNormalization", "Add", "Reshape"), ()),
-    ("float_residual", ("LayerNormalization", "Add", "Reshape"), ("output/dense",)),
     ("float_residual_ffn", ("LayerNormalization", "Add", "Reshape", "Gelu"), ("output/dense", "intermediate/dense")),
-    ("float_residual_ffn_embed", ("LayerNormalization", "Add", "Reshape", "Gelu", "Gather"), ("output/dense", "intermediate/dense")),
 ]
 
 
@@ -418,18 +414,14 @@ def main(src, tok_path, out_dir):
         shutil.copy(pre, ln)
     report["softmax_chain_after"] = softmax_chain(ln)
     print("ops feeding softmax after folding:", report["softmax_chain_after"])
-    plain = os.path.join(tmp, "plain.onnx")
-    shutil.copy(ln, plain)
-    report["diag_outputs"] = expose_internals(plain, ln)
-    print("internal tensors exposed:", len(report["diag_outputs"]))
+    report["diag_outputs"] = []
     report["ln_vs_original"] = cosine(ref, embed(ln, test))
     print("final fp32 model vs original (cosine avg, worst):", report["ln_vs_original"])
 
     # 4. Quantization recipe search: score each on CPU, keep the best
     calib12 = calib + [encode(tok, make_docs(BATCH, 3000 + i)) for i in range(6)]
-    diag_names = [d["name"] for d in report["diag_outputs"]]
+    diag_names = []
     print("op types in model:", sorted(op_counts(ln).items()))
-    print("sample Gemm node names:", [n.name for n in onnx.load(ln).graph.node if n.op_type == "Gemm"][:6])
     rows = run_recipes(ln, calib12, test, ref, diag_names, tmp)
     quant_rows = [r for r in rows if r.get("path")]
     best = max(quant_rows, key=lambda r: r["avg"]) if quant_rows else {"path": None}

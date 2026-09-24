@@ -62,7 +62,7 @@ class MainActivity : Activity() {
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
-            addView(title); addView(subtitle); addView(status); addView(npuButton); addView(embedButton); addView(diagButton); addView(npuLog)
+            addView(title); addView(subtitle); addView(status); addView(npuButton); addView(embedButton); addView(npuLog)
         }
         val scroll = ScrollView(this).apply { addView(column) }
         // Keep content clear of the status bar and navigation bar (edge-to-edge on Android 15+).
