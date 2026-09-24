@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
+import org.json.JSONObject
 import java.io.File
 import java.nio.LongBuffer
 import java.util.Random
@@ -15,74 +16,69 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * M2: a real embedding model (all-MiniLM-L6-v2) on realistic documents,
- * CPU vs Hexagon NPU, with accuracy, op placement proof, and a sustained power run.
+ * M2.1: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
+ * each accelerator variant is scored for speed, accuracy (PASS at cosine 0.99) and where its
+ * operations ran. The best passing NPU variant then gets a sustained power run.
  */
 object EmbedBench {
     private const val BATCH = 16
     private const val SEQ = 256
-    private const val MODEL = "minilm_16x256.onnx"
+    private const val LN_MODEL = "minilm_ln_16x256.onnx"
+    private const val Q_MODEL = "minilm_a16w8_16x256.onnx"
+    private const val HTP = "libQnnHtp.so"
+    private const val GPU = "libQnnGpu.so"
+    private const val PASS = 0.99
     private const val NOMINAL_V = 3.85
     private const val SUSTAIN_S = 45
     private const val IDLE_S = 10
 
-    private class Timing(val tokPerSec: Double, val msPerBatch: Double, val emb: Array<FloatArray>)
+    private class Variant(val label: String, val file: String, val backend: String, val fp16: Boolean)
+
+    private val VARIANTS = listOf(
+        Variant("NPU fp16, fused LayerNorm", LN_MODEL, HTP, true),
+        Variant("NPU quantized (16-bit activations, 8-bit weights)", Q_MODEL, HTP, false),
+        Variant("GPU fp32 (Adreno), for comparison", LN_MODEL, GPU, false),
+    )
+
+    private class Timing(val tokPerSec: Double, val emb: Array<FloatArray>)
+    private class Result(val v: Variant, val tokPerSec: Double, val avg: Double, val worst: Double, val strict: Boolean)
 
     fun run(ctx: Context, log: (String) -> Unit) {
         val env = OrtEnvironment.getEnvironment()
         val tok = WordPiece(ctx.assets.open("vocab.txt").bufferedReader().readLines())
-        log("Preparing model (first run copies about 90 MB, a few seconds)...")
-        val model = assetToFile(ctx, MODEL)
         val batches = (0 until 4).map { tok.encodeBatch(Docs.make(BATCH, it.toLong()), SEQ) }
         log("Model: all-MiniLM-L6-v2 (22M parameters), $BATCH documents x $SEQ tokens per batch")
-        log("Real tokens per batch: ${batches[0].realTokens}")
+        buildReport(ctx)?.let(log)
+        log("Preparing models (first run copies about 120 MB)...")
+        val paths = mapOf(LN_MODEL to assetToFile(ctx, LN_MODEL), Q_MODEL to assetToFile(ctx, Q_MODEL))
 
-        // 1. CPU (ONNX Runtime, same model) for a fair comparison
         val cpu = try {
             OrtSession.SessionOptions().use { o ->
-                env.createSession(model, o).use { s -> measure(env, s, batches, 2) }
+                env.createSession(paths.getValue(LN_MODEL), o).use { s -> measure(env, s, batches, 2) }
             }
         } catch (e: Exception) {
-            log("CPU run failed: ${NpuTest.reason(e)}"); return
+            log("CPU reference failed: ${NpuTest.reason(e)}"); return
         }
-        log("CPU: ${f0(cpu.tokPerSec)} tokens/sec (${f0(cpu.msPerBatch)} ms per batch)")
+        log("CPU fp32 reference: ${f0(cpu.tokPerSec)} tokens/sec")
 
-        // 2. NPU, strict first (proves full offload), then with fallback if needed
-        val profile = File(ctx.filesDir, "embed_profile").absolutePath
-        var strict = true
-        var npuOpts = npuOptions(profile, true)
-        var session = try {
-            env.createSession(model, npuOpts)
-        } catch (e: Exception) {
-            npuOpts.close()
-            log("Strict NPU mode refused: ${NpuTest.reason(e).take(300)}")
-            log("Retrying with CPU fallback allowed, to see how much runs on the NPU...")
-            strict = false
-            npuOpts = npuOptions(profile, false)
-            try {
-                env.createSession(model, npuOpts)
-            } catch (e2: Exception) {
-                npuOpts.close()
-                log("NPU run failed: ${NpuTest.reason(e2)}"); return
-            }
-        }
-        try {
-            val npu = measure(env, session, batches, 4)
-            log("NPU: ${f0(npu.tokPerSec)} tokens/sec (${f0(npu.msPerBatch)} ms per batch)")
-            log("Speed: NPU is ${f1(npu.tokPerSec / cpu.tokPerSec)}x the CPU on the same model")
-            log(accuracy(cpu.emb, npu.emb))
-            log(NpuTest.providerReport(session.endProfiling()) +
-                if (strict) "" else "\n(fallback mode: some work may be on the CPU)")
-        } catch (e: Exception) {
-            log("NPU benchmark failed: ${NpuTest.reason(e)}")
-        } finally {
-            session.close(); npuOpts.close()
+        val results = ArrayList<Result>()
+        for (v in VARIANTS) {
+            log("\n[${v.label}]")
+            runVariant(ctx, env, paths.getValue(v.file), v, batches, cpu, log)?.let { results.add(it) }
         }
 
-        // 3. Sustained NPU run with power measurement (profiling off)
-        val opts = npuOptions(null, strict)
+        val npu = results.filter { it.v.backend == HTP }
+        val best = npu.filter { it.avg >= PASS }.maxByOrNull { it.tokPerSec } ?: npu.maxByOrNull { it.avg }
+        log("\nSUMMARY")
+        for (r in results) {
+            log("${if (r.avg >= PASS) "PASS" else "FAIL"}  ${r.v.label}: ${f0(r.tokPerSec)} tok/s, accuracy ${f4(r.avg)}")
+        }
+        if (best == null) { log("No NPU variant ran."); return }
+        log("Best NPU variant: ${best.v.label}${if (best.avg >= PASS) "" else " (still below 0.99)"}")
+
+        val opts = options(best.v, null, best.strict)
         try {
-            env.createSession(model, opts).use { s -> sustained(ctx, env, s, batches, log) }
+            env.createSession(paths.getValue(best.v.file), opts).use { s -> sustained(ctx, env, s, batches, log) }
         } catch (e: Exception) {
             log("Sustained run failed: ${NpuTest.reason(e)}")
         } finally {
@@ -90,27 +86,84 @@ object EmbedBench {
         }
     }
 
-    /** Copies the model out of the APK once, so ONNX Runtime can load it without using app memory. */
+    private fun runVariant(ctx: Context, env: OrtEnvironment, path: String, v: Variant,
+                           batches: List<WordPiece.Batch>, cpu: Timing, log: (String) -> Unit): Result? {
+        val profile = File(ctx.filesDir, "embed_profile").absolutePath
+        var strict = true
+        var opts = options(v, profile, true)
+        val session = try {
+            env.createSession(path, opts)
+        } catch (e: Exception) {
+            opts.close()
+            log("Strict mode refused: ${NpuTest.reason(e).take(200)}")
+            strict = false
+            opts = options(v, profile, false)
+            try {
+                env.createSession(path, opts)
+            } catch (e2: Exception) {
+                opts.close()
+                log("Could not run: ${NpuTest.reason(e2).take(300)}")
+                return null
+            }
+        }
+        try {
+            val t = measure(env, session, batches, 4)
+            val (avg, worst) = cosines(cpu.emb, t.emb)
+            log("Speed: ${f0(t.tokPerSec)} tokens/sec (${f1(t.tokPerSec / cpu.tokPerSec)}x the CPU)")
+            log("Accuracy vs CPU: average ${f4(avg)}, worst ${f4(worst)}  ${if (avg >= PASS) "PASS" else "FAIL"}")
+            log(NpuTest.providerReport(session.endProfiling()) + if (strict) "" else "\n(CPU fallback was allowed)")
+            return Result(v, t.tokPerSec, avg, worst, strict)
+        } catch (e: Exception) {
+            log("Failed while running: ${NpuTest.reason(e)}")
+            return null
+        } finally {
+            session.close(); opts.close()
+        }
+    }
+
+    private fun options(v: Variant, profilePath: String?, strict: Boolean): OrtSession.SessionOptions {
+        val o = OrtSession.SessionOptions()
+        if (strict) o.addConfigEntry("session.disable_cpu_ep_fallback", "1")
+        if (profilePath != null) o.enableProfiling(profilePath)
+        val qnn = HashMap<String, String>()
+        qnn["backend_path"] = v.backend
+        if (v.backend == HTP) {
+            qnn["htp_performance_mode"] = "burst"
+            if (v.fp16) qnn["enable_htp_fp16_precision"] = "1"
+        }
+        NpuTest.addQnn(o, qnn)
+        return o
+    }
+
+    /** Checks the build server ran on this model (overflow diagnosis and CPU-side accuracy). */
+    private fun buildReport(ctx: Context): String? = try {
+        val j = JSONObject(ctx.assets.open("embed_variants.json").bufferedReader().readText())
+        val sb = StringBuilder("Build-server checks:")
+        if (j.has("max_layernorm_square")) {
+            val mx = j.getDouble("max_layernorm_square")
+            sb.append("\n  Largest value squared inside LayerNorm: ${"%,.0f".format(mx)} (fp16 limit 65,504)")
+            sb.append(if (mx > 65504) " -> OVERFLOW, cause confirmed" else " -> no overflow")
+        }
+        j.optJSONObject("fused")?.let { f ->
+            sb.append("\n  Fused: ${f.optInt("LayerNormalization")} LayerNorm, ${f.optInt("Gelu")} Gelu (loose Pow left: ${f.optInt("Pow")})")
+        }
+        j.optJSONArray("a16w8_vs_original")?.let { a ->
+            sb.append("\n  Quantized model on CPU: accuracy ${f4(a.getDouble(0))}")
+        }
+        sb.toString()
+    } catch (e: Exception) {
+        null
+    }
+
+    /** Copies a model out of the APK once, so ONNX Runtime can load it without using app memory. */
     private fun assetToFile(ctx: Context, name: String): String {
-        val f = File(ctx.filesDir, "m2_$name")
+        val f = File(ctx.filesDir, "m21_$name")
         if (!f.exists() || f.length() == 0L) {
-            val tmp = File(ctx.filesDir, "m2_$name.tmp")
+            val tmp = File(ctx.filesDir, "m21_$name.tmp")
             ctx.assets.open(name).use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
             tmp.renameTo(f)
         }
         return f.absolutePath
-    }
-
-    private fun npuOptions(profilePath: String?, strict: Boolean): OrtSession.SessionOptions {
-        val o = OrtSession.SessionOptions()
-        if (strict) o.addConfigEntry("session.disable_cpu_ep_fallback", "1")
-        if (profilePath != null) o.enableProfiling(profilePath)
-        NpuTest.addQnn(o, mapOf(
-            "backend_path" to "libQnnHtp.so",
-            "htp_performance_mode" to "burst",
-            "enable_htp_fp16_precision" to "1",
-        ))
-        return o
     }
 
     private fun feeds(env: OrtEnvironment, s: OrtSession, b: WordPiece.Batch): Map<String, OnnxTensor> {
@@ -143,7 +196,7 @@ object EmbedBench {
                 }
             }
             val secs = (System.nanoTime() - t0) / 1e9
-            return Timing(tokens / secs, secs * 1000 / (reps * batches.size), emb)
+            return Timing(tokens / secs, emb)
         } finally {
             allFeeds.forEach { f -> f.values.forEach { it.close() } }
         }
@@ -156,8 +209,8 @@ object EmbedBench {
             log("Sustained run skipped: unplug the charger to measure power")
             return
         }
-        log("Measuring idle power for ${IDLE_S}s, leave the phone alone...")
-        val idle = sample(bm, IDLE_S * 1000L) {}
+        log("\nMeasuring idle power for ${IDLE_S}s, leave the phone alone...")
+        val idle = sample(bm, IDLE_S * 1000L)
         val tempStart = tempC(ctx)
         log("Sustained NPU run for ${SUSTAIN_S}s...")
         val allFeeds = batches.map { feeds(env, s, it) }
@@ -193,12 +246,11 @@ object EmbedBench {
         }
     }
 
-    private fun sample(bm: BatteryManager, ms: Long, between: () -> Unit): List<Double> {
+    private fun sample(bm: BatteryManager, ms: Long): List<Double> {
         val out = ArrayList<Double>()
         val end = System.currentTimeMillis() + ms
         while (System.currentTimeMillis() < end) {
             out.add(abs(bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)) / 1000.0)
-            between()
             Thread.sleep(500)
         }
         return out
@@ -217,7 +269,9 @@ object EmbedBench {
         val fb = t.floatBuffer
         val flat = FloatArray(fb.remaining()).also { fb.get(it) }
         return if (shape.size == 3) {
-            val (b, sq, h) = Triple(shape[0].toInt(), shape[1].toInt(), shape[2].toInt())
+            val b = shape[0].toInt()
+            val sq = shape[1].toInt()
+            val h = shape[2].toInt()
             Array(b) { row ->
                 val v = FloatArray(h)
                 var n = 0
@@ -227,10 +281,12 @@ object EmbedBench {
                     val base = (row * sq + p) * h
                     for (k in 0 until h) v[k] += flat[base + k]
                 }
-                normalize(v.also { arr -> if (n > 0) for (k in arr.indices) arr[k] /= n })
+                if (n > 0) for (k in 0 until h) v[k] /= n
+                normalize(v)
             }
         } else {
-            val (b, h) = Pair(shape[0].toInt(), shape[1].toInt())
+            val b = shape[0].toInt()
+            val h = shape[1].toInt()
             Array(b) { row -> normalize(flat.copyOfRange(row * h, row * h + h)) }
         }
     }
@@ -243,16 +299,17 @@ object EmbedBench {
         return v
     }
 
-    private fun accuracy(a: Array<FloatArray>, b: Array<FloatArray>): String {
-        if (a.isEmpty() || a.size != b.size) return "Accuracy: could not compare"
+    private fun cosines(a: Array<FloatArray>, b: Array<FloatArray>): Pair<Double, Double> {
+        if (a.isEmpty() || a.size != b.size) return Pair(0.0, 0.0)
         val sims = a.indices.map { i -> a[i].indices.sumOf { k -> (a[i][k] * b[i][k]).toDouble() } }
-        return "Accuracy vs CPU: average cosine ${"%.5f".format(sims.average())}, worst ${"%.5f".format(sims.min())} (1.0 = identical)"
+        return Pair(sims.average(), sims.min())
     }
 
     private fun f0(x: Double) = "%.0f".format(x)
     private fun f1(x: Double) = "%.1f".format(x)
     private fun f2(x: Double) = "%.2f".format(x)
     private fun f3(x: Double) = "%.3f".format(x)
+    private fun f4(x: Double) = "%.4f".format(x)
 }
 
 /** Realistic-length test documents (same generator as the Termux benchmark). */

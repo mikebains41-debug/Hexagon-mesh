@@ -82,7 +82,7 @@ class MainActivity : Activity() {
     }
 
     private fun startEmbedBench() {
-        runInBackground("Running embedding benchmark (about 2 minutes, keep the app open, unplugged for power numbers)...") { log ->
+        runInBackground("Running embedding benchmark (about 3 minutes, keep the app open, unplugged for power numbers)...") { log ->
             EmbedBench.run(this, log)
         }
     }

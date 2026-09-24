@@ -24,13 +24,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Prepare embedding model (all-MiniLM-L6-v2, fixed 16x256)
+      - name: Prepare embedding models (diagnose fp16, fuse LayerNorm, quantize)
         run: |
-          pip install onnx onnxruntime numpy
+          pip install onnx onnxruntime numpy tokenizers
           mkdir -p android/app/src/main/assets
           curl -fL -o /tmp/minilm.onnx https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx
+          curl -fL -o /tmp/tokenizer.json https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json
           curl -fL -o android/app/src/main/assets/vocab.txt https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt
-          python tools/prepare_embed_model.py /tmp/minilm.onnx android/app/src/main/assets/minilm_16x256.onnx
+          python tools/prepare_embed_model.py /tmp/minilm.onnx /tmp/tokenizer.json android/app/src/main/assets
 
       - name: Generate NPU test model
         run: mkdir -p android/app/src/main/assets && python3 tools/make_npu_test_model.py android/app/src/main/assets/npu_test.onnx
