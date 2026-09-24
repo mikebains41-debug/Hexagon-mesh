@@ -203,7 +203,6 @@ def main(src, tok_path, out_dir):
     # 4. Quantize for the NPU: 16-bit activations, 8-bit weights
     q = os.path.join(out_dir, "minilm_a16w8_16x256.onnx")
     qcfg = get_qnn_qdq_config(ln, Reader(calib), activation_type=QuantType.QUInt16, weight_type=QuantType.QUInt8)
-    qcfg.extra_options["CalibMaxIntermediateOutputs"] = 2
     quantize(ln, q, qcfg)
     report["a16w8_vs_original"] = cosine(ref, embed(q, test))
     print("quantized vs original (cosine avg, worst):", report["a16w8_vs_original"])
