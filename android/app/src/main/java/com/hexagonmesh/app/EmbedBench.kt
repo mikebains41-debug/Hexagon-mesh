@@ -16,7 +16,7 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * M2.2: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
+ * M2.3: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
  * each accelerator variant is scored for speed, accuracy (PASS at cosine 0.99) and where its
  * operations ran. The best passing NPU variant then gets a sustained power run.
  */
@@ -25,7 +25,6 @@ object EmbedBench {
     private const val SEQ = 256
     private const val LN_MODEL = "minilm_ln_16x256.onnx"
     private const val Q8_MODEL = "minilm_a16w8_16x256.onnx"
-    private const val Q16_MODEL = "minilm_a16w16_16x256.onnx"
     private const val HTP = "libQnnHtp.so"
     private const val GPU = "libQnnGpu.so"
     private const val PASS = 0.99
@@ -36,9 +35,8 @@ object EmbedBench {
     private class Variant(val label: String, val file: String, val backend: String, val fp16: Boolean)
 
     private val VARIANTS = listOf(
-        Variant("NPU fp16, pre-scaled LayerNorm", LN_MODEL, HTP, true),
-        Variant("NPU quantized, 16-bit weights", Q16_MODEL, HTP, false),
-        Variant("NPU quantized, 8-bit weights", Q8_MODEL, HTP, false),
+        Variant("NPU quantized (16-bit act, 8-bit weights), attention fixed", Q8_MODEL, HTP, false),
+        Variant("NPU fp16, attention fixed", LN_MODEL, HTP, true),
         Variant("GPU fp32 (Adreno), for comparison", LN_MODEL, GPU, false),
     )
 
@@ -51,8 +49,8 @@ object EmbedBench {
         val batches = (0 until 4).map { tok.encodeBatch(Docs.make(BATCH, it.toLong()), SEQ) }
         log("Model: all-MiniLM-L6-v2 (22M parameters), $BATCH documents x $SEQ tokens per batch")
         buildReport(ctx)?.let(log)
-        log("Preparing models (first run copies about 160 MB)...")
-        val paths = listOf(LN_MODEL, Q8_MODEL, Q16_MODEL).associateWith { assetToFile(ctx, it) }
+        log("Preparing models (first run copies about 120 MB)...")
+        val paths = listOf(LN_MODEL, Q8_MODEL).associateWith { assetToFile(ctx, it) }
 
         val cpu = try {
             OrtSession.SessionOptions().use { o ->
@@ -153,14 +151,22 @@ object EmbedBench {
             val sc = j.getDouble("prescale")
             sb.append("\n  LayerNorm inputs pre-scaled by ${"%.4f".format(sc)}: squares ${"%.0f".format(1 / (sc * sc))}x smaller")
         }
-        j.optJSONArray("ln_vs_original")?.let { a ->
-            sb.append("\n  Pre-scaled model vs original (CPU): ${f4(a.getDouble(0))}")
+        if (j.has("attention_scale_folded")) {
+            sb.append("\n  Attention scaling folded into Q in ${j.getInt("attention_scale_folded")} layers")
+            sb.append("\n  Ops feeding softmax: ${j.optString("softmax_chain_before")} -> ${j.optString("softmax_chain_after")}")
         }
-        j.optJSONArray("a16w16_vs_original")?.let { a ->
-            sb.append("\n  16-bit weights on CPU: ${f4(a.getDouble(0))}")
+        j.optJSONArray("ln_vs_original")?.let { a ->
+            sb.append("\n  Rewritten fp32 model vs original (CPU): ${f4(a.getDouble(0))}")
         }
         j.optJSONArray("a16w8_vs_original")?.let { a ->
-            sb.append("\n  8-bit weights on CPU: ${f4(a.getDouble(0))}")
+            sb.append("\n  Quantized model on CPU: ${f4(a.getDouble(0))} (worst ${f4(a.getDouble(1))})")
+        }
+        j.optJSONArray("worst_tensors")?.let { w ->
+            sb.append("\n  Least precise internal values after quantization (signal/noise, lower = worse):")
+            for (i in 0 until minOf(w.length(), 5)) {
+                val row = w.getJSONObject(i)
+                sb.append("\n    ${row.optDouble("snr_db")} dB  ${row.optString("tensor")}")
+            }
         }
         sb.toString()
     } catch (e: Exception) {
@@ -169,9 +175,9 @@ object EmbedBench {
 
     /** Copies a model out of the APK once, so ONNX Runtime can load it without using app memory. */
     private fun assetToFile(ctx: Context, name: String): String {
-        val f = File(ctx.filesDir, "m22_$name")
+        val f = File(ctx.filesDir, "m23_$name")
         if (!f.exists() || f.length() == 0L) {
-            val tmp = File(ctx.filesDir, "m22_$name.tmp")
+            val tmp = File(ctx.filesDir, "m23_$name.tmp")
             ctx.assets.open(name).use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
             tmp.renameTo(f)
         }

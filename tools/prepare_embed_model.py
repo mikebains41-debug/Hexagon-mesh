@@ -1,10 +1,9 @@
 """Prepares the NPU embedding models and diagnoses fp16 accuracy (runs on GitHub's build server).
 
 Outputs in OUT_DIR:
-  minilm_ln_16x256.onnx      fp32, static 16x256, LayerNorm + Gelu fused, LayerNorm inputs pre-scaled
-                             (CPU reference, GPU, and NPU fp16 variant)
+  minilm_ln_16x256.onnx      fp32, static 16x256, LayerNorm + Gelu fused, LayerNorm inputs pre-scaled,
+                             attention scaling folded into Q (CPU reference, GPU, and NPU fp16 variant)
   minilm_a16w8_16x256.onnx   quantized for the NPU: 16-bit activations, 8-bit weights
-  minilm_a16w16_16x256.onnx  quantized for the NPU: 16-bit activations, 16-bit weights
   embed_variants.json       build-server checks shown in the app
 
 Usage: python tools/prepare_embed_model.py MODEL.onnx TOKENIZER.json OUT_DIR
@@ -166,6 +165,82 @@ def prescale_layernorms(src, dst, scale):
     return count
 
 
+def fold_attention_scale(src, dst):
+    """Moves the attention score scaling (MatMul -> Div/Mul by a constant) in front of the MatMul, onto Q.
+    Same math, but the score tensor is scaled down before it is stored, so it cannot overflow fp16 and
+    16-bit quantization gets finer steps. Returns the number of folds."""
+    m = onnx.load(src)
+    g = m.graph
+    consts = {i.name: numpy_helper.to_array(i) for i in g.initializer}
+    for n in g.node:
+        if n.op_type == "Constant":
+            for a in n.attribute:
+                if a.name == "value":
+                    consts[n.output[0]] = numpy_helper.to_array(a.t)
+    producer = {o: n for n in g.node for o in n.output}
+    consumers = {}
+    for n in g.node:
+        for i in n.input:
+            consumers.setdefault(i, []).append(n)
+    folds, remove = 0, set()
+    for n in list(g.node):
+        if n.op_type not in ("Div", "Mul") or len(n.input) != 2 or n.input[1] not in consts:
+            continue
+        c = consts[n.input[1]]
+        if c.size != 1:
+            continue
+        mm = producer.get(n.input[0])
+        if mm is None or mm.op_type != "MatMul" or len(consumers.get(mm.output[0], [])) != 1:
+            continue
+        if not any(x.op_type in ("Add", "Softmax", "Where") for x in consumers.get(n.output[0], [])):
+            continue
+        factor = (1.0 / float(c)) if n.op_type == "Div" else float(c)
+        scale_name = "attn_scale_%d" % folds
+        g.initializer.append(numpy_helper.from_array(np.array(factor, dtype=np.float32), scale_name))
+        scaled = mm.input[0] + "_attn_scaled_%d" % folds
+        mul = helper.make_node("Mul", [mm.input[0], scale_name], [scaled], name=scale_name + "_mul")
+        idx = list(g.node).index(mm)
+        g.node.insert(idx, mul)
+        mm.input[0] = scaled
+        mm.output[0] = n.output[0]
+        remove.add(n.name or id(n))
+        folds += 1
+        n.op_type = "__REMOVE__"
+    keep = [n for n in g.node if n.op_type != "__REMOVE__"]
+    del g.node[:]
+    g.node.extend(keep)
+    onnx.save(m, dst)
+    return folds
+
+
+def softmax_chain(path, depth=4):
+    """Op types feeding the first Softmax, for the build log (e.g. Add <- Div <- MatMul)."""
+    g = onnx.load(path).graph
+    producer = {o: n for n in g.node for o in n.output}
+    sm = next((n for n in g.node if n.op_type == "Softmax"), None)
+    chain, cur = [], sm
+    while cur is not None and len(chain) < depth:
+        chain.append(cur.op_type)
+        cur = producer.get(cur.input[0]) if cur.input else None
+    return " <- ".join(chain)
+
+
+def worst_quantized_tensors(float_path, q_path, batch, tmp, top=8):
+    """ONNX Runtime's quantization debugger: signal-to-noise (dB) of every internal value, lowest = worst."""
+    from onnxruntime.quantization.qdq_loss_debug import (
+        collect_activations, compute_activation_error, create_activation_matching,
+        modify_model_output_intermediate_tensors)
+    fa, qa = os.path.join(tmp, "float_aug.onnx"), os.path.join(tmp, "q_aug.onnx")
+    modify_model_output_intermediate_tensors(float_path, fa)
+    modify_model_output_intermediate_tensors(q_path, qa)
+    f_act = collect_activations(fa, Reader([batch]))
+    q_act = collect_activations(qa, Reader([batch]))
+    errs = compute_activation_error(create_activation_matching(q_act, f_act))
+    rows = [(name, e["xmodel_err"]) for name, e in errs.items() if "xmodel_err" in e]
+    rows.sort(key=lambda r: r[1])
+    return [{"tensor": n[:60], "snr_db": round(float(v), 1)} for n, v in rows[:top]]
+
+
 def op_counts(path):
     counts = {}
     for n in onnx.load(path).graph.node:
@@ -219,25 +294,45 @@ def main(src, tok_path, out_dir):
     report["fused"] = {k: counts.get(k, 0) for k in ("LayerNormalization", "Gelu", "Pow", "Erf")}
     print("ops after fusion:", report["fused"])
 
-    ln = os.path.join(out_dir, "minilm_ln_16x256.onnx")
-    report["prescaled_layernorms"] = prescale_layernorms(fused, ln, LN_PRESCALE)
+    pre = os.path.join(tmp, "prescaled.onnx")
+    report["prescaled_layernorms"] = prescale_layernorms(fused, pre, LN_PRESCALE)
     report["prescale"] = LN_PRESCALE
-    print("pre-scaled LayerNorms:", report["prescaled_layernorms"])
-
     ref = embed(fixed, test)
-    report["ln_vs_original"] = cosine(ref, embed(ln, test))
-    print("fused + pre-scaled fp32 vs original (cosine avg, worst):", report["ln_vs_original"])
 
-    # 4. Quantize for the NPU: 16-bit activations with 8-bit and with 16-bit weights
-    variants = [("a16w8", QuantType.QUInt8), ("a16w16", QuantType.QUInt16)]
-    outputs = [ln]
-    for name, wtype in variants:
-        q = os.path.join(out_dir, "minilm_%s_16x256.onnx" % name)
-        qcfg = get_qnn_qdq_config(ln, Reader(calib), activation_type=QuantType.QUInt16, weight_type=wtype)
-        quantize(ln, q, qcfg)
-        report["%s_vs_original" % name] = cosine(ref, embed(q, test))
-        print("%s vs original (cosine avg, worst):" % name, report["%s_vs_original" % name])
-        outputs.append(q)
+    ln = os.path.join(out_dir, "minilm_ln_16x256.onnx")
+    report["softmax_chain_before"] = softmax_chain(pre)
+    print("ops feeding softmax before folding:", report["softmax_chain_before"])
+    folded = fold_attention_scale(pre, ln)
+    report["attention_scale_folded"] = folded
+    if folded:
+        cos_fold = cosine(ref, embed(ln, test))
+        print("attention scale folded in %d layers; folded fp32 vs original:" % folded, cos_fold)
+        if cos_fold[0] < 0.999:
+            print("folding changed results, reverting")
+            report["attention_scale_folded"] = 0
+            shutil.copy(pre, ln)
+    else:
+        shutil.copy(pre, ln)
+    report["softmax_chain_after"] = softmax_chain(ln)
+    print("ops feeding softmax after folding:", report["softmax_chain_after"])
+    report["ln_vs_original"] = cosine(ref, embed(ln, test))
+    print("final fp32 model vs original (cosine avg, worst):", report["ln_vs_original"])
+
+    # 4. Quantize for the NPU: 16-bit activations, 8-bit weights
+    q = os.path.join(out_dir, "minilm_a16w8_16x256.onnx")
+    qcfg = get_qnn_qdq_config(ln, Reader(calib), activation_type=QuantType.QUInt16, weight_type=QuantType.QUInt8)
+    quantize(ln, q, qcfg)
+    report["a16w8_vs_original"] = cosine(ref, embed(q, test))
+    print("quantized vs original (cosine avg, worst):", report["a16w8_vs_original"])
+    outputs = [ln, q]
+
+    # 5. Debug: which internal values lose the most precision when quantized?
+    try:
+        report["worst_tensors"] = worst_quantized_tensors(ln, q, test[0], tmp)
+        for row in report["worst_tensors"]:
+            print("  low SNR: %5.1f dB  %s" % (row["snr_db"], row["tensor"]))
+    except Exception as e:
+        print("quantization debugger skipped:", e)
 
     with open(os.path.join(out_dir, "embed_variants.json"), "w") as fh:
         json.dump(report, fh)
