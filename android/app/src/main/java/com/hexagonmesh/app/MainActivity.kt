@@ -14,7 +14,12 @@ import android.os.Looper
 import android.os.PowerManager
 import android.system.Os
 import android.view.WindowInsets
+import android.Manifest
+import android.content.pm.PackageManager
+import android.text.InputType
 import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -26,10 +31,17 @@ class MainActivity : Activity() {
     private lateinit var npuButton: Button
     private lateinit var embedButton: Button
     private lateinit var diagButton: Button
+    private lateinit var nodeButton: Button
+    private lateinit var nodeText: TextView
+    private lateinit var urlField: EditText
+    private lateinit var walletField: EditText
+    private lateinit var keyField: EditText
+    private lateinit var ignoreRules: CheckBox
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
             status.text = readStatus()
+            refreshNode()
             handler.postDelayed(this, 2000)
         }
     }
@@ -59,10 +71,38 @@ class MainActivity : Activity() {
             setOnClickListener { startDiag() }
         }
         npuLog = TextView(this).apply { textSize = 15f; setPadding(0, pad, 0, pad) }
+        val prefs = NodeService.prefs(this)
+        val nodeTitle = TextView(this).apply { text = "Network node"; textSize = 22f; setPadding(0, pad, 0, 0) }
+        urlField = EditText(this).apply {
+            hint = "Coordinator address"
+            setText(prefs.getString("url", NodeService.DEFAULT_URL))
+            inputType = InputType.TYPE_TEXT_VARIATION_URI
+            isSingleLine = true
+        }
+        walletField = EditText(this).apply {
+            hint = "Wallet (payout name or address)"
+            setText(prefs.getString("wallet", ""))
+            isSingleLine = true
+        }
+        keyField = EditText(this).apply {
+            hint = "API key (optional)"
+            setText(prefs.getString("key", ""))
+            isSingleLine = true
+        }
+        ignoreRules = CheckBox(this).apply {
+            text = "Ignore charging rules (testing only)"
+            isChecked = prefs.getBoolean("ignore_rules", false)
+        }
+        nodeButton = Button(this).apply { setOnClickListener { toggleNode() } }
+        nodeText = TextView(this).apply { textSize = 16f; setPadding(0, pad / 2, 0, pad) }
+        val testsTitle = TextView(this).apply { text = "Tests"; textSize = 22f; setPadding(0, pad, 0, 0) }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
-            addView(title); addView(subtitle); addView(status); addView(npuButton); addView(embedButton); addView(npuLog)
+            addView(title); addView(subtitle); addView(status)
+            addView(nodeTitle); addView(urlField); addView(walletField); addView(keyField); addView(ignoreRules)
+            addView(nodeButton); addView(nodeText)
+            addView(testsTitle); addView(npuButton); addView(embedButton); addView(npuLog)
         }
         val scroll = ScrollView(this).apply { addView(column) }
         // Keep content clear of the status bar and navigation bar (edge-to-edge on Android 15+).
@@ -80,6 +120,41 @@ class MainActivity : Activity() {
             insets
         }
         setContentView(scroll)
+    }
+
+    private fun toggleNode() {
+        if (NodeState.running) {
+            startService(Intent(this, NodeService::class.java).setAction(NodeService.ACTION_STOP))
+            return
+        }
+        NodeService.prefs(this).edit()
+            .putString("url", urlField.text.toString().trim().ifEmpty { NodeService.DEFAULT_URL })
+            .putString("wallet", walletField.text.toString().trim())
+            .putString("key", keyField.text.toString().trim())
+            .putBoolean("ignore_rules", ignoreRules.isChecked)
+            .apply()
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
+        startForegroundService(Intent(this, NodeService::class.java))
+        NodeState.running = true
+        NodeState.status = "Starting..."
+        refreshNode()
+    }
+
+    private fun refreshNode() {
+        nodeButton.text = if (NodeState.running) "Stop node" else "Start node"
+        val id = NodeService.nodeId(this)
+        nodeText.text = buildString {
+            appendLine("Node ID: ${id.take(8)}")
+            appendLine("Status: ${NodeState.status}")
+            if (NodeState.backend.isNotEmpty()) appendLine("Running on: ${NodeState.backend}")
+            appendLine("Tickets done: ${NodeState.tickets} (${NodeState.texts} texts)")
+            if (NodeState.lastTicketMs > 0) appendLine("Last ticket: ${NodeState.lastTicketMs} ms")
+            append("Credits earned: ${"%.4f".format(NodeState.credits)}")
+            if (NodeState.lastError.isNotEmpty()) append("\nLast problem: ${NodeState.lastError.take(120)}")
+        }
     }
 
     private fun startNpuTest() {

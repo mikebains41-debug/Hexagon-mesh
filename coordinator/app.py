@@ -13,7 +13,7 @@ from flask import Flask, abort, jsonify, request
 
 from . import assembler, db, splitter, verifier
 
-REPLICAS = 2                 # phones per ticket
+REPLICAS = int(os.environ.get("HM_REPLICAS", "2"))   # phones per ticket (1 = solo testing)
 MAX_REPLICAS = 4             # give up after this many disagreeing results
 LEASE_SECONDS = int(os.environ.get("HM_LEASE", "300"))
 CREDITS_PER_1K_TOKENS = 1.0
@@ -183,11 +183,11 @@ def resolve_ticket(c, ticket_id, now):
     payload = json.loads(t["payload"])
     subs = c.execute("SELECT * FROM assignments WHERE ticket_id=? AND status='submitted' "
                      "ORDER BY id", (ticket_id,)).fetchall()
-    if len(subs) < 2:
+    if len(subs) < min(2, t["needed"]):
         return "waiting"
 
     results = [(s, json.loads(s["result"])) for s in subs]
-    winner = None
+    winner = results[0][1] if t["needed"] == 1 else None
     for i in range(len(results)):
         for k in range(i + 1, len(results)):
             if verifier.agree(t["job_type"], payload, results[i][1], results[k][1]):

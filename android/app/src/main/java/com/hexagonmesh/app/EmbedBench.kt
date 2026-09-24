@@ -16,7 +16,7 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * M2.9: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
+ * M3: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
  * each accelerator variant is scored for speed, accuracy (PASS at cosine 0.99) and where its
  * operations ran. The best passing NPU variant then gets a sustained power run.
  */
@@ -89,14 +89,14 @@ object EmbedBench {
                            batches: List<WordPiece.Batch>, cpu: Timing, log: (String) -> Unit): Result? {
         val profile = File(ctx.filesDir, "embed_profile").absolutePath
         var strict = true
-        var opts = options(v, profile, true)
+        var opts = options(v, null, true)
         val session = try {
             env.createSession(path, opts)
         } catch (e: Exception) {
             opts.close()
             log("Strict mode refused: ${NpuTest.reason(e).take(200)}")
             strict = false
-            opts = options(v, profile, false)
+            opts = options(v, null, false)
             try {
                 env.createSession(path, opts)
             } catch (e2: Exception) {
@@ -106,11 +106,24 @@ object EmbedBench {
             }
         }
         try {
-            val t = measure(env, session, batches, 4)
+            val t = measure(env, session, batches, 8)
             val (avg, worst) = cosines(cpu.emb, t.emb)
             log("Speed: ${f0(t.tokPerSec)} tokens/sec (${f1(t.tokPerSec / cpu.tokPerSec)}x the CPU)")
             log("Accuracy vs CPU: average ${f4(avg)}, worst ${f4(worst)}  ${if (avg >= PASS) "PASS" else "FAIL"}")
-            log(NpuTest.providerReport(session.endProfiling()) + if (strict) "" else "\n(CPU fallback was allowed)")
+            val proof = try {
+                val po = options(v, profile, strict)
+                try {
+                    env.createSession(path, po).use { ps ->
+                        measure(env, ps, batches.take(1), 1)
+                        NpuTest.providerReport(ps.endProfiling())
+                    }
+                } finally {
+                    po.close()
+                }
+            } catch (e: Exception) {
+                "Placement check failed: ${NpuTest.reason(e).take(120)}"
+            }
+            log(proof + if (strict) "" else "\n(CPU fallback was allowed)")
             return Result(v, t.tokPerSec, avg, worst, strict)
         } catch (e: Exception) {
             log("Failed while running: ${NpuTest.reason(e)}")
