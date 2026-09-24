@@ -19,7 +19,7 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 from onnx import TensorProto, helper, numpy_helper, version_converter
-from onnxruntime.quantization import CalibrationDataReader, QuantType, quantize
+from onnxruntime.quantization import CalibrationDataReader, CalibrationMethod, QuantType, quantize
 from onnxruntime.quantization.execution_providers.qnn import get_qnn_qdq_config, qnn_preprocess_model
 from tokenizers import Tokenizer
 
@@ -267,6 +267,67 @@ def expose_internals(src, dst):
     return [{"name": n, "label": l} for n, l in picks]
 
 
+def nodes_of_types(path, types):
+    return [n.name for n in onnx.load(path).graph.node if n.op_type in types]
+
+
+def internal_cosines(float_path, q_path, batch, names):
+    """Per-checkpoint cosine (real tokens only) between the float model and a quantized model on CPU."""
+    fs = ort.InferenceSession(float_path, providers=["CPUExecutionProvider"])
+    qs = ort.InferenceSession(q_path, providers=["CPUExecutionProvider"])
+    fo = dict(zip(names, fs.run(names, feeds_for(fs, batch))))
+    qo = dict(zip(names, qs.run(names, feeds_for(qs, batch))))
+    mask = batch["attention_mask"].astype(bool)
+    out = {}
+    for n in names:
+        a, b = fo[n], qo[n]
+        if a.ndim == 3:
+            a, b = a[mask], b[mask]
+        else:
+            continue
+        num = (a * b).sum(1)
+        den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12
+        out[n] = float((num / den).mean())
+    return out
+
+
+RECIPES = [
+    ("minmax", {}, {}, 6),
+    ("minmax_12batches", {}, {}, 12),
+    ("percentile", {"calibrate_method": CalibrationMethod.Percentile}, {"CalibPercentile": 99.999}, 6),
+    ("symmetric_act", {"activation_symmetric": True}, {}, 6),
+    ("int8_sym_weights", {"weight_type": QuantType.QInt8}, {}, 6),
+    ("float_layernorm_gelu", {"exclude_types": ("LayerNormalization", "Gelu")}, {}, 6),
+    ("float_residual_adds", {"exclude_types": ("Add",)}, {}, 6),
+]
+
+
+def run_recipes(ln, calib_batches, test, ref, diag_names, tmp):
+    rows = []
+    for name, kwargs, extra, nbatches in RECIPES:
+        q = os.path.join(tmp, "q_%s.onnx" % name)
+        kw = dict(kwargs)
+        exclude = kw.pop("exclude_types", None)
+        if exclude:
+            kw["nodes_to_exclude"] = nodes_of_types(ln, exclude)
+        try:
+            cfg = get_qnn_qdq_config(ln, Reader(calib_batches[:nbatches]),
+                                     activation_type=QuantType.QUInt16,
+                                     weight_type=kw.pop("weight_type", QuantType.QUInt8), **kw)
+            cfg.extra_options.update(extra)
+            quantize(ln, q, cfg)
+            avg, worst = cosine(ref, embed(q, test))
+            layers = internal_cosines(ln, q, test[0], diag_names)
+            first = min(layers.values()) if layers else None
+            rows.append({"recipe": name, "avg": round(avg, 4), "worst": round(worst, 4),
+                         "worst_layer": round(first, 4) if first is not None else None, "path": q})
+            print("recipe %-22s final %.4f (worst doc %.4f)  worst checkpoint %.4f" % (name, avg, worst, first or 0))
+        except Exception as e:
+            print("recipe %-22s FAILED: %s" % (name, str(e)[:160]))
+            rows.append({"recipe": name, "avg": 0.0, "worst": 0.0, "worst_layer": None, "path": None, "error": str(e)[:160]})
+    return rows
+
+
 def op_counts(path):
     counts = {}
     for n in onnx.load(path).graph.node:
@@ -348,12 +409,19 @@ def main(src, tok_path, out_dir):
     report["ln_vs_original"] = cosine(ref, embed(ln, test))
     print("final fp32 model vs original (cosine avg, worst):", report["ln_vs_original"])
 
-    # 4. Quantize for the NPU: 16-bit activations, 8-bit weights
+    # 4. Quantization recipe search: score each on CPU, keep the best
+    calib12 = calib + [encode(tok, make_docs(BATCH, 3000 + i)) for i in range(6)]
+    diag_names = [d["name"] for d in report["diag_outputs"]]
+    rows = run_recipes(ln, calib12, test, ref, diag_names, tmp)
+    best = max(rows, key=lambda r: r["avg"])
+    if best["path"] is None:
+        sys.exit("every quantization recipe failed")
     q = os.path.join(out_dir, "minilm_a16w8_16x256.onnx")
-    qcfg = get_qnn_qdq_config(ln, Reader(calib), activation_type=QuantType.QUInt16, weight_type=QuantType.QUInt8)
-    quantize(ln, q, qcfg)
-    report["a16w8_vs_original"] = cosine(ref, embed(q, test))
-    print("quantized vs original (cosine avg, worst):", report["a16w8_vs_original"])
+    shutil.copy(best["path"], q)
+    report["quant_recipe"] = best["recipe"]
+    report["recipes"] = [{k: v for k, v in r.items() if k != "path"} for r in rows]
+    report["a16w8_vs_original"] = (best["avg"], best["worst"])
+    print("best recipe:", best["recipe"], best["avg"])
     outputs = [ln, q]
 
     with open(os.path.join(out_dir, "embed_variants.json"), "w") as fh:

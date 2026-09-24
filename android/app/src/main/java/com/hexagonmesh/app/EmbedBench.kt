@@ -16,7 +16,7 @@ import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * M2.3: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
+ * M2.5: all-MiniLM-L6-v2 embeddings on realistic documents. A fp32 CPU run is the reference;
  * each accelerator variant is scored for speed, accuracy (PASS at cosine 0.99) and where its
  * operations ran. The best passing NPU variant then gets a sustained power run.
  */
@@ -35,8 +35,7 @@ object EmbedBench {
     private class Variant(val label: String, val file: String, val backend: String, val fp16: Boolean)
 
     private val VARIANTS = listOf(
-        Variant("NPU quantized (16-bit act, 8-bit weights), attention fixed", Q8_MODEL, HTP, false),
-        Variant("NPU fp16, attention fixed", LN_MODEL, HTP, true),
+        Variant("NPU quantized (16-bit act, 8-bit weights), best recipe", Q8_MODEL, HTP, false),
         Variant("GPU fp32 (Adreno), for comparison", LN_MODEL, GPU, false),
     )
 
@@ -158,8 +157,15 @@ object EmbedBench {
         j.optJSONArray("ln_vs_original")?.let { a ->
             sb.append("\n  Rewritten fp32 model vs original (CPU): ${f4(a.getDouble(0))}")
         }
-        j.optJSONArray("a16w8_vs_original")?.let { a ->
-            sb.append("\n  Quantized model on CPU: ${f4(a.getDouble(0))} (worst ${f4(a.getDouble(1))})")
+        j.optJSONArray("recipes")?.let { rs ->
+            sb.append("\n  Quantization recipes scored on the build server (CPU):")
+            for (i in 0 until rs.length()) {
+                val r = rs.getJSONObject(i)
+                val err = r.optString("error", "")
+                sb.append("\n    ${r.optString("recipe")}: " +
+                    if (err.isNotEmpty()) "failed" else "${f4(r.optDouble("avg"))} (worst doc ${f4(r.optDouble("worst"))})")
+            }
+            sb.append("\n  Shipped recipe: ${j.optString("quant_recipe")}")
         }
         sb.toString()
     } catch (e: Exception) {
@@ -168,9 +174,9 @@ object EmbedBench {
 
     /** Copies a model out of the APK once, so ONNX Runtime can load it without using app memory. */
     internal fun assetToFile(ctx: Context, name: String): String {
-        val f = File(ctx.filesDir, "m24_$name")
+        val f = File(ctx.filesDir, "m25_$name")
         if (!f.exists() || f.length() == 0L) {
-            val tmp = File(ctx.filesDir, "m24_$name.tmp")
+            val tmp = File(ctx.filesDir, "m25_$name.tmp")
             ctx.assets.open(name).use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
             tmp.renameTo(f)
         }
