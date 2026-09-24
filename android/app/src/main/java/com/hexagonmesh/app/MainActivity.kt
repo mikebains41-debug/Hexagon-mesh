@@ -25,6 +25,7 @@ class MainActivity : Activity() {
     private lateinit var npuLog: TextView
     private lateinit var npuButton: Button
     private lateinit var embedButton: Button
+    private lateinit var diagButton: Button
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
@@ -53,11 +54,15 @@ class MainActivity : Activity() {
             text = "Run embedding benchmark (real AI)"
             setOnClickListener { startEmbedBench() }
         }
+        diagButton = Button(this).apply {
+            text = "Run NPU diagnosis (where does it diverge?)"
+            setOnClickListener { startDiag() }
+        }
         npuLog = TextView(this).apply { textSize = 15f; setPadding(0, pad, 0, pad) }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
-            addView(title); addView(subtitle); addView(status); addView(npuButton); addView(embedButton); addView(npuLog)
+            addView(title); addView(subtitle); addView(status); addView(npuButton); addView(embedButton); addView(diagButton); addView(npuLog)
         }
         val scroll = ScrollView(this).apply { addView(column) }
         // Keep content clear of the status bar and navigation bar (edge-to-edge on Android 15+).
@@ -87,9 +92,14 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun startDiag() {
+        runInBackground("Running NPU diagnosis (about 1 minute)...") { log -> Diag.run(this, log) }
+    }
+
     private fun runInBackground(intro: String, task: ((String) -> Unit) -> Unit) {
         npuButton.isEnabled = false
         embedButton.isEnabled = false
+        diagButton.isEnabled = false
         npuLog.text = intro + "\n"
         Thread {
             try {
@@ -100,6 +110,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 npuButton.isEnabled = true
                 embedButton.isEnabled = true
+                diagButton.isEnabled = true
                 npuLog.append("Done.\n")
             }
         }.start()

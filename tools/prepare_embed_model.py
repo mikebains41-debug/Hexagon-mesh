@@ -241,6 +241,32 @@ def worst_quantized_tensors(float_path, q_path, batch, tmp, top=8):
     return [{"tensor": n[:60], "snr_db": round(float(v), 1)} for n, v in rows[:top]]
 
 
+def expose_internals(src, dst):
+    """Adds internal tensors as extra model outputs so the app can compare CPU vs NPU step by step:
+    every LayerNormalization output, plus the first Softmax (attention) and first Gelu output."""
+    m = onnx.load(src)
+    g = m.graph
+    existing = {o.name for o in g.output}
+    picks, ln_i, layer = [], 0, 0
+    seen_softmax = seen_gelu = False
+    for n in g.node:
+        if n.op_type == "LayerNormalization":
+            label = "embeddings LN" if ln_i == 0 else "layer %d %s LN" % ((ln_i - 1) // 2, "attention" if (ln_i - 1) % 2 == 0 else "output")
+            picks.append((n.output[0], label))
+            ln_i += 1
+        elif n.op_type == "Softmax" and not seen_softmax:
+            picks.append((n.output[0], "layer 0 attention probs"))
+            seen_softmax = True
+        elif n.op_type == "Gelu" and not seen_gelu:
+            picks.append((n.output[0], "layer 0 Gelu"))
+            seen_gelu = True
+    for name, _ in picks:
+        if name not in existing:
+            g.output.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, None))
+    onnx.save(m, dst)
+    return [{"name": n, "label": l} for n, l in picks]
+
+
 def op_counts(path):
     counts = {}
     for n in onnx.load(path).graph.node:
@@ -315,6 +341,10 @@ def main(src, tok_path, out_dir):
         shutil.copy(pre, ln)
     report["softmax_chain_after"] = softmax_chain(ln)
     print("ops feeding softmax after folding:", report["softmax_chain_after"])
+    plain = os.path.join(tmp, "plain.onnx")
+    shutil.copy(ln, plain)
+    report["diag_outputs"] = expose_internals(plain, ln)
+    print("internal tensors exposed:", len(report["diag_outputs"]))
     report["ln_vs_original"] = cosine(ref, embed(ln, test))
     print("final fp32 model vs original (cosine avg, worst):", report["ln_vs_original"])
 
@@ -325,14 +355,6 @@ def main(src, tok_path, out_dir):
     report["a16w8_vs_original"] = cosine(ref, embed(q, test))
     print("quantized vs original (cosine avg, worst):", report["a16w8_vs_original"])
     outputs = [ln, q]
-
-    # 5. Debug: which internal values lose the most precision when quantized?
-    try:
-        report["worst_tensors"] = worst_quantized_tensors(ln, q, test[0], tmp)
-        for row in report["worst_tensors"]:
-            print("  low SNR: %5.1f dB  %s" % (row["snr_db"], row["tensor"]))
-    except Exception as e:
-        print("quantization debugger skipped:", e)
 
     with open(os.path.join(out_dir, "embed_variants.json"), "w") as fh:
         json.dump(report, fh)

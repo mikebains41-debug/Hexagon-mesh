@@ -161,23 +161,16 @@ object EmbedBench {
         j.optJSONArray("a16w8_vs_original")?.let { a ->
             sb.append("\n  Quantized model on CPU: ${f4(a.getDouble(0))} (worst ${f4(a.getDouble(1))})")
         }
-        j.optJSONArray("worst_tensors")?.let { w ->
-            sb.append("\n  Least precise internal values after quantization (signal/noise, lower = worse):")
-            for (i in 0 until minOf(w.length(), 5)) {
-                val row = w.getJSONObject(i)
-                sb.append("\n    ${row.optDouble("snr_db")} dB  ${row.optString("tensor")}")
-            }
-        }
         sb.toString()
     } catch (e: Exception) {
         null
     }
 
     /** Copies a model out of the APK once, so ONNX Runtime can load it without using app memory. */
-    private fun assetToFile(ctx: Context, name: String): String {
-        val f = File(ctx.filesDir, "m23_$name")
+    internal fun assetToFile(ctx: Context, name: String): String {
+        val f = File(ctx.filesDir, "m24_$name")
         if (!f.exists() || f.length() == 0L) {
-            val tmp = File(ctx.filesDir, "m23_$name.tmp")
+            val tmp = File(ctx.filesDir, "m24_$name.tmp")
             ctx.assets.open(name).use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
             tmp.renameTo(f)
         }
