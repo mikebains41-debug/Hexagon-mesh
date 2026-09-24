@@ -1,0 +1,10 @@
+HEXAGON MESH BENCHMARK  20260923-1650
+Result: time limit reached after 10.0 min
+Documents: 2112  Tokens: 584188
+Average speed: 1033 tokens/sec
+First 2 min: 1104 tok/s   Last 2 min: 1023 tok/s   (change -7%)
+Temperature: 32.6C start, 33.0C peak, 33.0C end
+Battery: 88% -> 82%
+If sustained for a 6-hour night: ~22 million tokens
+Power: 1026 mA working, 1155 mA idle -> ~0.00 W for AI work (at 3.85V nominal)
+Data: bench/results/bench-20260923-1650.csv
