@@ -118,6 +118,8 @@ class NodeService : Service() {
                     }
                     val ticket = if (r.code == 200) r.body.optJSONObject("ticket") else null
                     if (ticket == null) {
+                        val bal = coord.balance(id)
+                        if (bal.code == 200) NodeState.credits = bal.body.optDouble("credits", NodeState.credits)
                         idle++
                         val ms = minOf(5_000L shl minOf(idle - 1, 5), 120_000L)
                         status("READY on ${emb.backend}. No work right now, next check in ${ms / 1000}s")

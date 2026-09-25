@@ -15,6 +15,8 @@ import android.os.PowerManager
 import android.system.Os
 import android.view.WindowInsets
 import android.Manifest
+import android.net.Uri
+import android.provider.Settings
 import android.content.pm.PackageManager
 import android.text.InputType
 import android.widget.Button
@@ -136,6 +138,15 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
+        // Samsung and others pause background apps; ask once for "Unrestricted" so the node keeps working overnight.
+        val power = getSystemService(PowerManager::class.java)
+        if (!power.isIgnoringBatteryOptimizations(packageName)) {
+            try {
+                startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+            } catch (e: Exception) {
+                // Some phones hide this screen; the node still runs, it may just pause more often.
+            }
         }
         startForegroundService(Intent(this, NodeService::class.java))
         NodeState.running = true

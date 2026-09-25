@@ -40,9 +40,28 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
+      - name: Unpack signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/hexagon.p12"
+            echo "HM_KEYSTORE_FILE=$RUNNER_TEMP/hexagon.p12" >> "$GITHUB_ENV"
+            echo "Signing with the permanent Hexagon Mesh key"
+          else
+            echo "::warning::No KEYSTORE_B64 secret: this build uses a temporary key and will not install over older builds"
+          fi
+
       - name: Build APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon
+        env:
+          HM_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          HM_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          gradle assembleDebug --no-daemon
+          if [ -n "$HM_KEYSTORE_FILE" ]; then
+            "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs app/build/outputs/apk/debug/app-debug.apk | grep -i "SHA-256" | head -1 || true
+          fi
 
       - name: Publish APK as the "latest" download
         env:

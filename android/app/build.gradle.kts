@@ -11,12 +11,30 @@ android {
         applicationId = "com.hexagonmesh.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 14
-        versionName = "0.14.0"
+        versionCode = 15
+        versionName = "0.15.0"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
+    // Permanent signing key, supplied by the build server from encrypted GitHub secrets.
+    // Same key on every build = updates install over the old app, settings kept.
+    val keystoreFile = System.getenv("HM_KEYSTORE_FILE")
+    signingConfigs {
+        create("hexagon") {
+            if (keystoreFile != null) {
+                storeFile = file(keystoreFile)
+                storeType = "pkcs12"
+                storePassword = System.getenv("HM_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("HM_KEY_ALIAS")
+                keyPassword = System.getenv("HM_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (keystoreFile != null) signingConfig = signingConfigs.getByName("hexagon")
+        }
         release { isMinifyEnabled = false }
     }
     packaging {
