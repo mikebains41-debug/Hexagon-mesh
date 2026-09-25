@@ -2,6 +2,7 @@ package com.hexagonmesh.app
 
 /** Live node status, written by NodeService and shown by MainActivity. */
 object NodeState {
+    @Volatile var generation = 0
     @Volatile var running = false
     @Volatile var status = "stopped"
     @Volatile var backend = ""

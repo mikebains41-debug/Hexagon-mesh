@@ -5,40 +5,62 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
 import android.content.Context
+import android.os.Build
 import java.nio.LongBuffer
 import kotlin.math.sqrt
 
-/** all-MiniLM-L6-v2 on the Hexagon NPU, using the verified mixed-precision model (0.999 vs CPU). */
+/**
+ * all-MiniLM-L6-v2 embeddings. Qualcomm phones run the verified mixed-precision model on the Hexagon NPU
+ * (strict: every operation must run there). Other phones run the full-precision model on the CPU,
+ * which is several times faster on a CPU than the NPU-tuned model.
+ */
 class NpuEmbedder(ctx: Context) : AutoCloseable {
     companion object {
         const val MODEL_NAME = "minilm-l6"
         private const val BATCH = 16
         private const val SEQ = 256
-        private const val MODEL_FILE = "minilm_a16w8_16x256.onnx"
+        private const val NPU_MODEL = "minilm_a16w8_16x256.onnx"
+        private const val CPU_MODEL = "minilm_ln_16x256.onnx"
+
+        fun isQualcomm(): Boolean =
+            Build.VERSION.SDK_INT >= 31 && Build.SOC_MANUFACTURER.equals("QTI", ignoreCase = true)
     }
 
     private val env = OrtEnvironment.getEnvironment()
     private val tok = WordPiece(ctx.assets.open("vocab.txt").bufferedReader().readLines())
-    private val opts = OrtSession.SessionOptions()
+    private val opts: OrtSession.SessionOptions
     private val session: OrtSession
     val backend: String
 
     init {
-        val path = EmbedBench.assetToFile(ctx, MODEL_FILE)
-        var s: OrtSession?
-        var b: String
-        try {
-            NpuTest.addQnn(opts, hashMapOf(
-                "backend_path" to "libQnnHtp.so",
-                "htp_performance_mode" to "burst",
-                "enable_htp_fp16_precision" to "1"))
-            s = env.createSession(path, opts)
-            b = "NPU"
-        } catch (e: Exception) {
-            s = env.createSession(path, OrtSession.SessionOptions())
-            b = "CPU (NPU unavailable)"
+        var o: OrtSession.SessionOptions? = null
+        var s: OrtSession? = null
+        var b = "CPU"
+        if (isQualcomm()) {
+            val npuOpts = OrtSession.SessionOptions()
+            try {
+                npuOpts.addConfigEntry("session.disable_cpu_ep_fallback", "1")
+                NpuTest.addQnn(npuOpts, hashMapOf(
+                    "backend_path" to "libQnnHtp.so",
+                    "htp_performance_mode" to "burst",
+                    "enable_htp_fp16_precision" to "1"))
+                s = env.createSession(EmbedBench.assetToFile(ctx, NPU_MODEL), npuOpts)
+                o = npuOpts
+                b = "NPU (Qualcomm Hexagon)"
+            } catch (e: Exception) {
+                npuOpts.close()
+                s = null
+            }
+        }
+        if (s == null) {
+            val cpuOpts = OrtSession.SessionOptions()
+            cpuOpts.setIntraOpNumThreads(maxOf(1, Runtime.getRuntime().availableProcessors() / 2))
+            s = env.createSession(EmbedBench.assetToFile(ctx, CPU_MODEL), cpuOpts)
+            o = cpuOpts
+            b = "CPU"
         }
         session = s!!
+        opts = o!!
         backend = b
     }
 

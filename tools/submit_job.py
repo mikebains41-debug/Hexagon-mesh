@@ -2,6 +2,7 @@
 
   python tools/submit_job.py            submit a 100-text embeddings job
   python tools/submit_job.py ID         show that job's status
+Settings: HM_URL (coordinator address), HM_MODEL (e.g. minilm-l6), HM_CUSTOMER_KEY (if the server needs one)
 """
 import json
 import os
@@ -12,10 +13,16 @@ URL = os.environ.get("HM_URL", "http://127.0.0.1:8080").rstrip("/")
 MODEL = os.environ.get("HM_MODEL", "sim-embed")
 
 
+KEY = os.environ.get("HM_CUSTOMER_KEY", "")
+
+
 def call(method, path, data=None):
+    headers = {"Content-Type": "application/json"}
+    if KEY:
+        headers["X-API-Key"] = KEY
     req = urllib.request.Request(URL + path, method=method,
                                  data=json.dumps(data).encode() if data is not None else None,
-                                 headers={"Content-Type": "application/json"})
+                                 headers=headers)
     with urllib.request.urlopen(req) as r:
         return json.loads(r.read())
 

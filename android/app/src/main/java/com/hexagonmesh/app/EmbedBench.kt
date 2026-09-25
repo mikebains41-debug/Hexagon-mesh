@@ -186,6 +186,7 @@ object EmbedBench {
     }
 
     /** Copies a model out of the APK once, so ONNX Runtime can load it without using app memory. */
+    @Synchronized
     internal fun assetToFile(ctx: Context, name: String): String {
         val f = File(ctx.filesDir, "m29_$name")
         if (!f.exists() || f.length() == 0L) {

@@ -45,6 +45,7 @@ class NodeService : Service() {
     }
 
     @Volatile private var stopping = false
+    @Volatile private var myGeneration = -1
     private var worker: Thread? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -75,8 +76,13 @@ class NodeService : Service() {
         super.onDestroy()
     }
 
+    /** True while this worker is the newest one; an older worker (e.g. from a quick stop/start) stays silent. */
+    private fun isCurrent() = myGeneration == NodeState.generation
+
     private fun loop() {
+        myGeneration = synchronized(NodeState) { ++NodeState.generation }
         NodeState.running = true
+        NodeState.backend = ""
         val p = prefs(this)
         val coord = Coordinator(p.getString("url", DEFAULT_URL) ?: DEFAULT_URL, p.getString("key", "") ?: "")
         val wallet = p.getString("wallet", "") ?: ""
@@ -89,8 +95,8 @@ class NodeService : Service() {
             status("Loading AI model...")
             val emb = NpuEmbedder(this)
             embedder = emb
-            NodeState.backend = emb.backend
-            while (!stopping) {
+            if (isCurrent()) NodeState.backend = emb.backend
+            while (!stopping && isCurrent()) {
                 val wait = if (ignoreRules) null else waitReason()
                 if (wait != null) {
                     releaseWake()
@@ -147,12 +153,14 @@ class NodeService : Service() {
                 }
             }
         } catch (e: Exception) {
-            NodeState.lastError = e.message ?: e.javaClass.simpleName
-            status("Stopped: ${NodeState.lastError.take(80)}")
+            if (isCurrent()) {
+                NodeState.lastError = e.message ?: e.javaClass.simpleName
+                status("Stopped: ${NodeState.lastError.take(80)}")
+            }
         } finally {
             embedder?.close()
             releaseWake()
-            NodeState.running = false
+            if (isCurrent()) NodeState.running = false
         }
     }
 
@@ -176,6 +184,7 @@ class NodeService : Service() {
     }
 
     private fun status(text: String) {
+        if (!isCurrent()) return
         NodeState.status = text
         getSystemService(NotificationManager::class.java).notify(NOTIF_ID, notification(text))
     }
